@@ -9,12 +9,33 @@ from collections import deque
 import stock_state
 import math
 import argparse
+import matplotlib.pyplot as plt
+
 
 ACTIONS = 2 # number of valid actions # 0: buy, 1: sell
 BATCH = 32 # size of minibatch
 
 DAYS_RANGE = 15
 INPUT_DIM = 7
+
+SUMMARY_FOLDER = "./lstm_summary/"              # folder for storing summary
+SAVED_PATH = "saved_lstm"                       # folder for storing models
+
+def getYear(mode):
+    while True:
+        years = raw_input(">>> Year range of "+mode+" set(START END): ")
+        years = years.split()
+        try:
+            years = [int(y) for y in years]
+            if not len(years) == 2:
+                print "should be two numbers seperated by space!!"
+                continue
+        except:
+            print "should be two numbers seperated by space!!"
+            continue 
+        break
+    return [str(y) for y in years]
+
 
 class MultiMarket:
     def __init__(self, market_path):
@@ -23,17 +44,32 @@ class MultiMarket:
         self.test_markets = []
         self.adjust = []
         self.comp = []
+        train_range = getYear("training")
+        test_range = getYear("testing")
         file = open(market_path, 'r')
         for line in file:
             try:
-                self.markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'_train.csv', 1., action_num=ACTIONS))
+                self.markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'.csv',
+                                                            bids=1.,
+                                                            action_num=ACTIONS,
+                                                            DAY_RANGE=DAYS_RANGE,
+                                                            start_y=train_range[0],
+                                                            end_y=train_range[1]))
                 adj = self.markets[-1].GetAdjust()
-                self.test_markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'_test.csv', 1., action_num=ACTIONS, Adjust=adj))
+                self.test_markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'.csv',
+                                                                 bids=1.,
+                                                                 action_num=ACTIONS,
+                                                                 DAY_RANGE=DAYS_RANGE,
+                                                                 start_y=test_range[0],
+                                                                 end_y=test_range[1],
+                                                                 Adjust=adj))
                 self.adjust.append(adj)
                 self.market_num += 1
                 self.comp.append(line[:-1])
-            except:
-                raise "stock data of comp. " + line[:-1] + "not found!"
+            except IOError:
+                raise Exception("stock data of comp. " + line[:-1] + "not found!")
+            except ValueError as e:
+                raise Exception("error: "+str(e))
         file.close()
 
     def NextTrainMkt(self):
@@ -70,6 +106,7 @@ class MODEL:
         
         self.s              = None                 # input observed state
         self.pred_action    = None                 # output actions prob
+        self.prob           = None                 # dropout prob
 
         ## training ##
         self.corr_action    = None
@@ -78,6 +115,7 @@ class MODEL:
         self.global_step    = None
 
         self.rev            = None
+        self.corr_or_not    = None
         self.accuracy       = None
         self.batch_rev      = None
 
@@ -87,24 +125,28 @@ class MODEL:
         ## testing ##
         self.testAcc        = None
         self.testRev        = None
-        self.trainRev        = None
+        self.trainRev       = None
         self.merged_test    = None
         
         self.test_comp_name = None
+
         ## build  model ##
-        self.createRNN()
-        # create saver
+        self.createRNN()                           # RNN Network
+        #self.createCNN()                          # CNN Network
+        self.createOP()
+        
+        ## create saver ##
         with self.sess.graph.as_default():
             self.saver = tf.train.Saver()
-        self.createOP()
-        # init network var ##
+        
+        ## init network var ##
         self.sess.run(self.init_op)
 
 
     def weight_variable(self, shape, name):
         fan_in = np.prod(shape[0:-1])
         fan_out = np.prod(shape[1:])
-        std = math.sqrt(1.0 / (fan_in + fan_out))
+        std = math.sqrt(3.0 / (fan_in + fan_out))
         initial = tf.truncated_normal(shape, stddev = std)
         #initial = tf.truncated_normal(shape, stddev = 0.01)
         return tf.Variable(initial, name=name)
@@ -112,7 +154,7 @@ class MODEL:
     def bias_variable(self, shape, name):
         fan_in = np.prod(shape[0:-1])
         fan_out = np.prod(shape[1:])
-        std = math.sqrt(1.0 / (fan_in + fan_out))
+        std = math.sqrt(3.0 / (fan_in + fan_out))
         #initial = tf.random_uniform([shape[-1]], minval=(-std), maxval=std)
         initial = tf.constant(0.01, shape=[shape[-1]])
         return tf.Variable(initial, name=name)
@@ -152,6 +194,7 @@ class MODEL:
 
     def createRNN(self):
         with self.sess.graph.as_default():
+            self.prob = tf.placeholder("float", name="keep_prob")
             # input layer #
             with tf.name_scope("input"):
                 self.s = tf.placeholder("float", [None, DAYS_RANGE, INPUT_DIM], name='input_state')
@@ -159,22 +202,24 @@ class MODEL:
                 s_re = tf.reshape(s_tran, [-1, INPUT_DIM])
                 s_list = tf.split(0, DAYS_RANGE, s_re) ## split s to DAYS_RANGE tensor of shape [BATCH, INPUT_DIM]
 
-            lstm_cell = rnn_cell.BasicLSTMCell(1024, forget_bias=1.0, state_is_tuple=True)
+            lstm_cell = rnn_cell.LSTMCell(1024, use_peepholes=True, forget_bias=1.0, state_is_tuple=True)
+            lstm_drop = rnn_cell.DropoutWrapper(lstm_cell, output_keep_prob=self.prob)
             lstm_stack = rnn_cell.MultiRNNCell([lstm_cell]*3, state_is_tuple=True)
 
             lstm_output, hidden_states = rnn.rnn(lstm_stack, s_list, dtype='float', scope='LSTMStack') # out: [timestep, batch, hidden], state: [cell, c+h, batch, hidden]
                 
             h_fc1 = self.FC_layer(lstm_output[-1], [1024, 1024], name='h_fc1', activate=True)
-            h_fc2 = self.FC_layer(h_fc1, [1024, ACTIONS], name='h_fc2', activate=False)
+            h_fc1_d = tf.nn.dropout(h_fc1, keep_prob=self.prob, name='h_fc1_drop')
+            h_fc2 = self.FC_layer(h_fc1_d, [1024, ACTIONS], name='h_fc2', activate=False)
 
-            # output layer
+            # output layer #
             self.pred_action = tf.nn.softmax(h_fc2)
 
 
     def createCNN(self):
        
         with self.sess.graph.as_default():
-            # input layer
+            # input layer #
             with tf.name_scope('input'):
                 self.s = tf.placeholder("float", [None, DAYS_RANGE, INPUT_DIM], name='input_state')
                 s_4d = tf.reshape(self.s, [-1, DAYS_RANGE, INPUT_DIM, 1])
@@ -183,6 +228,7 @@ class MODEL:
             '''h_conv1_2x = self.conv2d_relu(s_4d, [5, 2, 1, 32], 1, name='h_conv1_2x')
             h_conv1_1x = self.conv2d_relu(s_4d, [5, 1, 1, 32], 1, name='h_conv1_1x')
             
+            # depth reduction of inception block #
             h_conv1_fx_inc = self.conv2d_relu(h_conv1_fx, [1, 1, 32, 12], 1, name='h_conv1_fx_inc')
             h_conv1_2x_inc = self.conv2d_relu(h_conv1_2x, [1, 1, 32, 10], 1, name='h_conv1_2x_inc')
             h_conv1_1x_inc = self.conv2d_relu(h_conv1_1x, [1, 1, 32, 10], 1, name='h_conv1_1x_inc')
@@ -197,7 +243,7 @@ class MODEL:
             h_fc1 = self.FC_layer(conv3_flat, [INPUT_DIM*DAYS_RANGE*64, 1024], name='h_fc1', activate=True)
             h_fc2 = self.FC_layer(h_fc1, [1024, ACTIONS], name='h_fc2', activate=False)
 
-            # output layer
+            # output layer #
             self.pred_action = tf.nn.softmax(h_fc2)
 
 
@@ -213,26 +259,26 @@ class MODEL:
                 print [v.name for v in tf.trainable_variables()]
 
                 cross_entropy = -tf.reduce_mean(tf.reduce_sum(tf.log(self.pred_action) * self.corr_action, reduction_indices=1))
-                self.cost = cross_entropy# + 0.0005*l2_loss ## total cost ##
+                self.cost = cross_entropy + 0.0000001*l2_loss ## total cost ##
                 
-                ## training op ##
+                # training op #
                 start_l_rate = 0.0001
                 decay_step = 100000
                 decay_rate = 0.5
                 learning_rate = tf.train.exponential_decay(start_l_rate, self.global_step, decay_step, decay_rate, staircase=False)
                 grad_op = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
                 self.train_step = tf.contrib.layers.optimize_loss(loss=self.cost, 
-                                                             global_step=self.global_step, 
-                                                             learning_rate=0.0001,
-                                                             optimizer=grad_op, 
-                                                             clip_gradients=1)
+                                                                  global_step=self.global_step, 
+                                                                  learning_rate=0.0001,
+                                                                  optimizer=grad_op, 
+                                                                  clip_gradients=1)
                 tf.scalar_summary('learning_rate', learning_rate)
                 tf.scalar_summary('l2_loss', l2_loss)
 
             with tf.name_scope('accuracy'):
-                corr_or_not = tf.cast(tf.equal(tf.argmax(self.corr_action, 1), tf.argmax(self.pred_action, 1)), tf.float32)
-                self.accuracy = tf.reduce_mean(corr_or_not)
-                self.batch_rev = tf.reduce_sum(tf.mul(corr_or_not*2-1, self.rev))
+                self.corr_or_not = tf.cast(tf.equal(tf.argmax(self.corr_action, 1), tf.argmax(self.pred_action, 1)), tf.float32)
+                self.accuracy = tf.reduce_mean(self.corr_or_not)
+                self.batch_rev = tf.reduce_sum(tf.mul(self.corr_or_not*2-1, self.rev))
         
         ## training op ##
         with self.sess.graph.as_default():
@@ -264,7 +310,7 @@ class MODEL:
         while True:
             test_data, test_label, test_r_t, terminal = self.test_Market.TestRNNBatch(1024)
             acc, batch_rev = self.sess.run([self.accuracy, self.batch_rev],
-                                           feed_dict={self.s : test_data, self.corr_action : test_label, self.rev : test_r_t})
+                                           feed_dict={self.s : test_data, self.corr_action : test_label, self.rev : test_r_t, self.prob : 1.})
             accuracy += acc
             tot_reward += batch_rev
             batch_num += 1.
@@ -275,13 +321,14 @@ class MODEL:
 
 
     def Inference(self):
-        # loading networks 
-        checkpoint = tf.train.get_checkpoint_state("saved_lstm")
+        ## loading networks ##
+        checkpoint = tf.train.get_checkpoint_state(SAVED_PATH)
         if checkpoint and checkpoint.model_checkpoint_path:
             self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
             print "Successfully loaded:", checkpoint.model_checkpoint_path
         else:
             print "Could not find old network weights"
+            self.sess_record.close()
             self.sess.close()
             sys.exit(0)
         
@@ -293,50 +340,62 @@ class MODEL:
                 break
             except:
                 print "Invalid idx "+str(idx)
-        print 'Testing '+comp_name+' Start at Date: ' + date_t
+        print 'Testing '+comp_name
         
+        plt.ion()
+        color_map = ['g-', 'r-']
         ## calc ACC ##
         accuracy = 0.
         tot_reward = 0.
         batch_num = 0.
+        Close_p = self.test_Market.GetClose()[DAYS_RANGE-1:]
+        full_corr_or_not = []
         while True:
             test_data, test_label, test_r_t, terminal = self.test_Market.TestRNNBatch(1024)
-            acc, batch_rev = self.sess.run([self.accuracy, self.batch_rev],
-                                           feed_dict={self.s : test_data, self.corr_action : test_label, self.rev : test_r_t})
+            acc, batch_rev, corr_or_not = self.sess.run([self.accuracy, self.batch_rev, self.corr_or_not],
+                                                        feed_dict={self.s : test_data, self.corr_action : test_label, self.rev : test_r_t, self.prob : 1.})
             accuracy += acc
             tot_reward += batch_rev
             batch_num += 1.
+            assert len(corr_or_not.shape) == 1
+            full_corr_or_not = full_corr_or_not + list(corr_or_not)
             if terminal:
                 break
         accuracy = accuracy / batch_num
-        print 'Testing '+comp_name+' End at Date: ' + date_t1 + \
+        print 'Testing '+comp_name+' End' \
               '  ACC: %.4f' % accuracy, \
               '  REV: %.4f' % tot_reward
+        self.sess_record.close()
         self.sess.close()
+        assert len(full_corr_or_not) == len(Close_p)
+        for i in xrange(len(full_corr_or_not)-1):
+            plt.plot([i, i+1], Close_p[i:i+2], color_map[int(full_corr_or_not[i])])
+        plt.show()
+        raw_input("press to continue...")
 
 
     def trainNetwork(self):
         
-        # create summaries folder
-        if tf.gfile.Exists('./lstm_summary/train'):
-            tf.gfile.DeleteRecursively('./lstm_summary/train')
-        tf.gfile.MakeDirs('./lstm_summary/train')
-        train_writer = tf.train.SummaryWriter('./lstm_summary/train', self.sess.graph)
+        ## create summaries folder ##
+        if tf.gfile.Exists(SUMMARY_FOLDER+'train'):
+            tf.gfile.DeleteRecursively(SUMMARY_FOLDER+'train')
+        tf.gfile.MakeDirs(SUMMARY_FOLDER+'train')
+        train_writer = tf.train.SummaryWriter(SUMMARY_FOLDER+'train', self.sess.graph)
         
-        if tf.gfile.Exists('./lstm_summary/record'):
-            tf.gfile.DeleteRecursively('./lstm_summary/record')
-        tf.gfile.MakeDirs('./lstm_summary/record')
-        record_writer = tf.train.SummaryWriter('./lstm_summary/record', self.sess_record.graph)
+        if tf.gfile.Exists(SUMMARY_FOLDER+'record'):
+            tf.gfile.DeleteRecursively(SUMMARY_FOLDER+'record')
+        tf.gfile.MakeDirs(SUMMARY_FOLDER+'record')
+        record_writer = tf.train.SummaryWriter(SUMMARY_FOLDER+'record', self.sess_record.graph)
 
-        # loading networks 
-        checkpoint = tf.train.get_checkpoint_state("saved_lstm")
+        ## loading networks ##
+        checkpoint = tf.train.get_checkpoint_state(SAVED_PATH)
         if checkpoint and checkpoint.model_checkpoint_path:
             self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
             print "Successfully loaded:", checkpoint.model_checkpoint_path
         else:
             print "Could not find old network weights"
 
-        # start training
+        ## start training ##
         outfile = sys.stdout
 
         best_acc = -1
@@ -354,13 +413,14 @@ class MODEL:
                     batch_x, batch_y, batch_r_t, terminal = self.Market.NextRNNBatch(BATCH)
                     run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                     run_metadata = tf.RunMetadata()
-                    # perform gradient step
+                    # perform gradient step #
                     _, summary, loss, batch_rev = self.sess.run([self.train_step, self.merged, self.cost, self.batch_rev], 
-                                                                feed_dict = {self.s : batch_x, self.corr_action : batch_y, self.rev : batch_r_t}, 
+                                                                feed_dict = {self.s : batch_x, self.corr_action : batch_y, self.rev : batch_r_t, self.prob : 0.85}, 
                                                                 options=run_options, 
                                                                 run_metadata=run_metadata)
-                    train_writer.add_run_metadata(run_metadata, str(step+1))
-                    train_writer.add_summary(summary, step+1)
+                    if (step+1) % 10 == 0:
+                        train_writer.add_run_metadata(run_metadata, str(step+1))
+                        train_writer.add_summary(summary, step+1)
                     tot_reward += batch_rev
                     outfile.write("    step: " + str(step+1).ljust(len(str(10**6))+4))
                     outfile.write("loss: " + "{:.4f}".format(loss).ljust(6+4) )
@@ -387,7 +447,7 @@ class MODEL:
                 
                 if accuracy > best_acc:
                     best_acc = accuracy
-                self.saver.save(self.sess, 'saved_lstm/' + "TSMC" + '-lstm', global_step=step)
+                self.saver.save(self.sess, SAVED_PATH+'/' + "TSMC" + '-lstm', global_step=step)
                 epoch += 1
                 ep_start = time.time()
         except KeyboardInterrupt:
@@ -400,7 +460,7 @@ class MODEL:
             outfile.write("elapsed time: " + "{:.2f}".format(time.time() - test_start).rjust(5) + ' secs/test \n')
             if accuracy > best_acc:
                 best_acc = accuracy
-                self.saver.save(self.sess, 'saved_lstm/' + "TSMC" + '-lstm', global_step=step)
+                self.saver.save(self.sess, SAVED_PATH+'/' + "TSMC" + '-lstm', global_step=step)
             print "Total Time:", time.time() - total_start
 
 
@@ -414,7 +474,7 @@ def main(mode):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stock Deep Q-Network")
+    parser = argparse.ArgumentParser(description="Stock Supervised Learning")
     parser.add_argument("-m","--mode", help="mode of DQN, default to train", choices=("train", "test"), default="train")
     args = parser.parse_args()
     main(args.mode)

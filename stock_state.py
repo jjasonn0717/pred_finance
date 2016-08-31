@@ -10,38 +10,44 @@ from scipy.fftpack import fft
 
 DAY_DELAY = 1
 DATA_LEN = 7
-DAY_RANGE = 15
 ACTIONS = 2
 BIDS = 1.
 
 class Stock_state:
-    def __init__(self, csv_path, bids, action_num, Adjust=None, min_len=None):
+    def __init__(self, csv_path, bids, action_num, DAY_RANGE=15, start_y=None, end_y=None, Adjust=None, min_len=None):
         self.bids = bids
+        self.DAY_RANGE = DAY_RANGE
         self.adjust = Adjust
         data_file = open(csv_path, 'r')
         reader = csv.reader(data_file)
         self.dates = []
         self.d_Close = []
+        self.Close = []
         self.daily_data = np.empty((0, DATA_LEN), dtype='float')
         self.header = np.array(reader.next()) # Dates High Low Open Close d_Close RSI9 RSI15 MA5 MA20 MA60 d_CO d_HL Adi_Close Volume VA/D d_VA/D %R8 %R21 DIF DEM d_MA5-20
         
         ## d_Close, d_MA5-20, d_VA/D, RSI9, RSI15, DIF, DEM ##
         ids = np.array([5, 21, 16, 6, 7, 19, 20])
         for line in reader:
+            if not start_y == None:
+                year = line[0].split('-')[0]
+                if year < start_y or year > end_y:
+                    continue
             self.dates.append(line[0])
             self.d_Close.append(float(line[5]))
+            self.Close.append(float(line[4]))
             data = np.array(line[1:], dtype='float')
             data = [data[ids-1]]
-            #data = np.asarray([ [line[10]] + [line[11]] + [line[5]] + [line[14]] + [line[6]] + [line[7]] + [line[8]] + [line[9]] ], dtype='float') 
             self.daily_data = np.append(self.daily_data, data, axis=0)
-        
+        ## if no data in given years range, raise an error ##
+        if len(self.dates) == 0:
+            raise ValueError("no complete data from "+start_y+"~"+end_y)
         ## data normalization ##
         if self.adjust == None:
             self.adjust = {"subs":np.array([], dtype='float'), "divs":np.array([], dtype='float')}
-            #self.daily_data[:,0] = (self.daily_data[:,0] - np.mean(self.daily_data[:,0], axis=0)) / np.std(self.daily_data[:,0], axis=0) ## z-score for d_close
             sub = np.mean(self.daily_data[:,0:3], axis=0)
             div = np.std(self.daily_data[:,0:3], axis=0)
-            self.daily_data[:,0:3] = (self.daily_data[:,0:3] - sub) / div ## min-max scaling
+            self.daily_data[:,0:3] = (self.daily_data[:,0:3] - sub) / div ## normalize
             self.adjust["subs"] = np.concatenate((self.adjust["subs"], sub))
             self.adjust["divs"] = np.concatenate((self.adjust["divs"], div))
 
@@ -60,12 +66,12 @@ class Stock_state:
             
         self.data_size = len(self.dates)
         assert self.daily_data.shape == (self.data_size, DATA_LEN)
-        print 'Load data from ' + self.header[0] + ',', self.data_size, 'days in total'
+        print 'Load data', self.dates[0], 'to', self.dates[-1], 'from ' + self.header[0] + ',', self.data_size, 'days in total'
         self.header = self.header[ids]
         data_file.close()
 
         ## for RNN ##
-        self.randomList = np.arange(self.data_size-DAY_RANGE + 1)
+        self.randomList = np.arange(self.data_size-self.DAY_RANGE + 1)
         random.shuffle(self.randomList)
         self.next_start = 0
         self.next_start_nonrand = 0
@@ -93,6 +99,9 @@ class Stock_state:
 
     def GetAdjust(self):
         return self.adjust
+
+    def GetClose(self):
+        return self.Close
 
     def Invest_step(self, action):
         next_day = self.daily_data[self.current]
@@ -126,7 +135,7 @@ class Stock_state:
         self.revenue += reward
 
         revenue = self.revenue
-        if (self.current - self.epi_start) == self.epi_len - 2:
+        if (self.current - self.epi_start) == self.epi_len - 1:
             if not self.min_len == None:
                 self.epi_len = random.randrange(self.min_len, self.data_size+1)
             self.current = random.randrange(self.data_size - self.epi_len + 1)
@@ -142,24 +151,24 @@ class Stock_state:
         return self.epi_len
 
     def NextRNNBatch(self, batch_size):
-        if self.next_start + batch_size < (self.data_size - DAY_RANGE + 1):
+        if self.next_start + batch_size < (self.data_size - self.DAY_RANGE + 1):
             real_batch_size = batch_size
         else:
-            real_batch_size = (self.data_size - DAY_RANGE) - self.next_start + 1
+            real_batch_size = (self.data_size - self.DAY_RANGE) - self.next_start + 1
         
-        batch_data = np.empty((0, DAY_RANGE, DATA_LEN), dtype='float')
+        batch_data = np.empty((0, self.DAY_RANGE, DATA_LEN), dtype='float')
         batch_label = np.empty((0, 2), dtype='float')
         batch_r_t = []
         for b_num in xrange(real_batch_size):
             day_range_data = np.empty((0, DATA_LEN), dtype='float')
             location = self.randomList[self.next_start + b_num]
-            for day_num in xrange(DAY_RANGE):
+            for day_num in xrange(self.DAY_RANGE):
                 single_day = self.daily_data[location + day_num]
                 day_range_data = np.append(day_range_data, [single_day], axis=0)
-            assert day_range_data.shape == (DAY_RANGE, DATA_LEN)
+            assert day_range_data.shape == (self.DAY_RANGE, DATA_LEN)
             batch_data = np.append(batch_data, [day_range_data], axis=0)
             
-            label_loca = (location + DAY_RANGE + DAY_DELAY) if (location + DAY_RANGE + DAY_DELAY) < self.data_size else self.data_size - 1
+            label_loca = (location + self.DAY_RANGE + DAY_DELAY) if (location + self.DAY_RANGE + DAY_DELAY) < self.data_size else self.data_size - 1
             r_t = self.d_Close[label_loca]
             if r_t >= 0:
                 label = [1, 0] ## ACTION_NUM = 2, 0:buy ; 1:sell
@@ -167,9 +176,9 @@ class Stock_state:
                 label = [0, 1]
             batch_label = np.append(batch_label, [label], axis=0)
             batch_r_t.append(abs(r_t))
-        assert batch_data.shape == (real_batch_size, DAY_RANGE, DATA_LEN) and batch_label.shape == (real_batch_size, 2)
+        assert batch_data.shape == (real_batch_size, self.DAY_RANGE, DATA_LEN) and batch_label.shape == (real_batch_size, 2)
 
-        if self.next_start + real_batch_size < self.data_size - DAY_RANGE + 1:
+        if self.next_start + real_batch_size < self.data_size - self.DAY_RANGE + 1:
             self.next_start = self.next_start + real_batch_size
             terminal = False
         else:
@@ -180,24 +189,24 @@ class Stock_state:
         return batch_data, batch_label, batch_r_t, terminal
 
     def TestRNNBatch(self, batch_size):
-        if self.next_start_nonrand + batch_size < (self.data_size - DAY_RANGE + 1):
+        if self.next_start_nonrand + batch_size < (self.data_size - self.DAY_RANGE + 1):
             real_batch_size = batch_size
         else:
-            real_batch_size = (self.data_size - DAY_RANGE) - self.next_start_nonrand + 1
+            real_batch_size = (self.data_size - self.DAY_RANGE) - self.next_start_nonrand + 1
         
-        batch_data = np.empty((0, DAY_RANGE, DATA_LEN), dtype='float')
+        batch_data = np.empty((0, self.DAY_RANGE, DATA_LEN), dtype='float')
         batch_label = np.empty((0, 2), dtype='float')
         batch_r_t = []
         for b_num in xrange(real_batch_size):
             day_range_data = np.empty((0, DATA_LEN), dtype='float')
             location = self.next_start_nonrand + b_num
-            for day_num in xrange(DAY_RANGE):
+            for day_num in xrange(self.DAY_RANGE):
                 single_day = self.daily_data[location + day_num]
                 day_range_data = np.append(day_range_data, [single_day], axis=0)
-            assert day_range_data.shape == (DAY_RANGE, DATA_LEN)
+            assert day_range_data.shape == (self.DAY_RANGE, DATA_LEN)
             batch_data = np.append(batch_data, [day_range_data], axis=0)
             
-            label_loca = (location + DAY_RANGE + DAY_DELAY) if (location + DAY_RANGE + DAY_DELAY) < self.data_size else self.data_size - 1
+            label_loca = (location + self.DAY_RANGE + DAY_DELAY) if (location + self.DAY_RANGE + DAY_DELAY) < self.data_size else self.data_size - 1
             r_t = self.d_Close[label_loca]
             if r_t >= 0:
                 label = [1, 0] ## ACTION_NUM = 2, 0:buy ; 1:sell
@@ -205,9 +214,9 @@ class Stock_state:
                 label = [0, 1]
             batch_label = np.append(batch_label, [label], axis=0)
             batch_r_t.append(abs(r_t))
-        assert batch_data.shape == (real_batch_size, DAY_RANGE, DATA_LEN) and batch_label.shape == (real_batch_size, 2)
+        assert batch_data.shape == (real_batch_size, self.DAY_RANGE, DATA_LEN) and batch_label.shape == (real_batch_size, 2)
 
-        if self.next_start_nonrand + real_batch_size < self.data_size - DAY_RANGE + 1:
+        if self.next_start_nonrand + real_batch_size < self.data_size - self.DAY_RANGE + 1:
             self.next_start_nonrand = self.next_start_nonrand + real_batch_size
             terminal = False
         else:
@@ -254,6 +263,22 @@ class Stock_state:
         
 
 
+def getYear(mode):
+    while True:
+        years = raw_input(">>> Year range of "+mode+" set(START END): ")
+        years = years.split()
+        try:
+            years = [int(y) for y in years]
+            if not len(years) == 2:
+                print "should be two numbers seperated by space!!"
+                continue
+        except:
+            print "should be two numbers seperated by space!!"
+            continue 
+        break
+    return [str(y) for y in years]
+
+
 
 if __name__ == "__main__":
 
@@ -261,10 +286,21 @@ if __name__ == "__main__":
     parser.add_argument("comp", help="the source of the data to draw")
     args = parser.parse_args()
 
+    train_range = getYear("training")
+    test_range = getYear("testing")
     try:
-        market = Stock_state("./stock_data/"+args.comp+"_train.csv", BIDS, ACTIONS)
+        market = Stock_state('./stock_data/'+args.comp+'.csv',
+                             bids=1.,
+                             action_num=ACTIONS,
+                             start_y=train_range[0],
+                             end_y=train_range[1])
         adj = market.GetAdjust()
-        test_market = Stock_state("./stock_data/"+args.comp+"_test.csv", BIDS, ACTIONS, Adjust=adj)
+        test_market = Stock_state('./stock_data/'+args.comp+'.csv',
+                                  bids=1.,
+                                  action_num=ACTIONS,
+                                  start_y=test_range[0],
+                                  end_y=test_range[1],
+                                  Adjust=adj)
     except:
         print "There is no data of " + args.comp + " in folder stock_data!"
         sys.exit(0)

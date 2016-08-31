@@ -33,6 +33,8 @@ if __name__ == "__main__":
         data = np.append(data, [np.array(line[1:], dtype='float')], axis=0)
     draw_file.close()
 
+    color = ['r-', 'b-']
+
     plt.ion()
     while True:
         ## get request column to draw ##
@@ -53,5 +55,6 @@ if __name__ == "__main__":
                 break
         print "Chosen column:", header[column], '\n'
         plt.plot(data[:,column-1], 'r-')#, data[:,column-1], 'ro')
+        #plt.plot(np.arange(100, 200), data[100:200,column-1], 'bo')#, data[:,column-1], 'ro')'''
         plt.title(header[column])
         plt.show()

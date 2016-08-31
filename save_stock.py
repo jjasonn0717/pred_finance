@@ -12,8 +12,10 @@ if __name__ == "__main__":
     parser.add_argument("name", help="company name of applied index")
     parser.add_argument("index", help="Stock index of the company")
     parser.add_argument("--end",'-e', help="ending date, yyyy-mm-dd/today default to today", default='today')
-    parser.add_argument("--start", '-s', help="starting date, yyyy-mm-dd, default to 1990-4-12", default='1990-4-12')
-    parser.add_argument("--ratio", '-r', help="ratio of training data, default to 0.8", type=float, default=0.8)
+    parser.add_argument("--start", '-s', help="starting date, yyyy-mm-dd, default to 1990-1-1", default='1990-1-1')
+    parser.add_argument("--ratio", '-r', help="ratio of training data, default to 1.0, which stand for no splittng and only one data file will be generated",
+                        type=float,
+                        default=1.0)
     args = parser.parse_args()
 
     name = args.name
@@ -39,8 +41,11 @@ if __name__ == "__main__":
     daily_RSI15 = np.array([], dtype='float')
     daily_VA_D = np.array([], dtype='float')
 
-    train_file = open('./stock_data/'+name+'_train.csv', 'w')
-    test_file = open('./stock_data/'+name+'_test.csv', 'w')
+    if TRAIN_RATIO == 1.0:
+        train_file = open('./stock_data/'+name+'.csv', 'w')
+    else:
+        train_file = open('./stock_data/'+name+'_train.csv', 'w')
+        test_file = open('./stock_data/'+name+'_test.csv', 'w')
 
 
     print "Days in total:", data_size
@@ -48,7 +53,9 @@ if __name__ == "__main__":
     print "Train:", int(data_size*TRAIN_RATIO), "  Test:", data_size - int(data_size*TRAIN_RATIO)
 
     train_file.write(Stock.get_info()['symbol'] + ',' + 'High,Low,Open,Close,d_Close,RSI9,RSI15,MA5,MA20,MA60,d_CO,d_HL,Adj_Close,Volume,VA/D,d_VA/D,%R8,%R21,DIF,DEM,d_MA5/20\n')
-    test_file.write(Stock.get_info()['symbol'] + ',' + 'High,Low,Open,Close,d_Close,RSI9,RSI15,MA5,MA20,MA60,d_CO,d_HL,Adj_Close,Volume,VA/D,d_VA/D,%R8,%R21,DIF,DEM,d_MA5/20\n')
+    if not TRAIN_RATIO == 1.0:
+        test_file.write(Stock.get_info()['symbol'] + ',' + 'High,Low,Open,Close,d_Close,RSI9,RSI15,MA5,MA20,MA60,d_CO,d_HL,Adj_Close,Volume,VA/D,d_VA/D,%R8,%R21,DIF,DEM,d_MA5/20\n')
+
     VA_D_tm1 = 0.
     EMA12_tm1 = 0.
     EMA26_tm1 = 0.
@@ -225,4 +232,5 @@ if __name__ == "__main__":
                              str(MA5-MA20) + '\n')
 
     train_file.close()
-    test_file.close()
+    if not TRAIN_RATIO == 1.0:
+        test_file.close()

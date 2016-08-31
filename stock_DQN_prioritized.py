@@ -1,20 +1,23 @@
 #!/usr/bin/env python
-##--------------------------------------##
-## double DQN,                          ##
-## Target Freezing,                     ##
-## multi-layer LSTM, CNN with inception ##
-##--------------------------------------##
+##------------------------------------##
+## double DQN,                        ##
+## Target Freezing,                   ##
+## CNN with inception,                ##
+## prioritized experience replay      ##
+##------------------------------------##
+
 from __future__ import print_function
 
 import tensorflow as tf
-from tensorflow.python.ops import rnn, rnn_cell
 import sys
 import random
 import numpy as np
 from collections import deque
 import stock_state
+import my_queue
 import math
 import argparse
+import matplotlib.pyplot as plt
 
 '''ACTIONS = 3 # number of valid actions # 0: do nothing, 1: buy, 2: sell
 ACTIONS_NAME = ['DO NOTHING', 'BUY', 'SELL']'''
@@ -28,12 +31,28 @@ INITIAL_EPSILON = 0.1 # starting value of epsilon
 REPLAY_MEMORY = 8000 # number of previous transitions to remember
 TARGET_UPDATE_FREQ = 100 # step interval to update target network
 BATCH = 32 # size of minibatch
-FRAME_PER_ACTION = 1
 
-DAYS_RANGE = 15
+DAYS_RANGE = 30
 INPUT_DIM = 7
 
-HIGH_THRE = 0.4
+HIGH_THRE = 0.7
+
+def getYear(mode):
+    while True:
+        years = raw_input(">>> Year range of "+mode+" set(START END): ")
+        years = years.split()
+        try:
+            years = [int(y) for y in years]
+            if not len(years) == 2:
+                print "should be two numbers seperated by space!!"
+                continue
+        except:
+            print "should be two numbers seperated by space!!"
+            continue 
+        break
+    return [str(y) for y in years]
+
+
 
 class MultiMarket:
     def __init__(self, market_path):
@@ -42,18 +61,33 @@ class MultiMarket:
         self.test_markets = []
         self.adjust = []
         self.comp = []
+        train_range = getYear("training")
+        test_range = getYear("testing")
         file = open(market_path, 'r')
         for line in file:
             try:
-                self.markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'_train.csv', 1., action_num=ACTIONS))
+                self.markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'.csv',
+                                                            bids=1.,
+                                                            action_num=ACTIONS,
+                                                            DAY_RANGE=DAYS_RANGE,
+                                                            start_y=train_range[0],
+                                                            end_y=train_range[1]))
                 adj = self.markets[-1].GetAdjust()
-                self.test_markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'_test.csv', 1., action_num=ACTIONS, Adjust=adj))
-                self.markets[-1].SetMinLen(self.test_markets[-1].GetSize())
+                self.test_markets.append(stock_state.Stock_state('./stock_data/'+line[:-1]+'.csv',
+                                                                 bids=1.,
+                                                                 action_num=ACTIONS,
+                                                                 DAY_RANGE=DAYS_RANGE,
+                                                                 start_y=test_range[0],
+                                                                 end_y=test_range[1],
+                                                                 Adjust=adj))
+                #self.markets[-1].SetMinLen(self.test_markets[-1].GetSize())
                 self.adjust.append(adj)
                 self.market_num += 1
                 self.comp.append(line[:-1])
-            except:
-                raise "stock data of comp. " + line[:-1] + "not found!"
+            except IOError:
+                raise Exception("stock data of comp. " + line[:-1] + "not found!")
+            except ValueError as e:
+                raise Exception("error: "+str(e))
         file.close()
 
     def NextTrainMkt(self):
@@ -65,11 +99,6 @@ class MultiMarket:
         idx = random.randrange(self.market_num)
         print("Next Test Market:", self.comp[idx])
         return self.test_markets[idx], self.comp[idx]
-
-    def InferMkt(self, idx=0):
-        print("Inference Market:", self.comp[idx])
-        return self.test_markets[idx], self.comp[idx]
-
 
 
 class DQN_module:
@@ -83,7 +112,7 @@ class DQN_module:
         self.test_Market    = None
 
         ## store the previous observations in replay memory ##
-        self.D              = deque()
+        self.D              = my_queue.myQueue(REPLAY_MEMORY, BATCH)
         
         ## init train session ##
         self.sess           = tf.InteractiveSession()
@@ -101,6 +130,8 @@ class DQN_module:
         ## training ##
         self.in_action      = None
         self.targetQ        = None
+        self.sample_IS      = None
+        self.TDErr          = None
         self.cost           = None
         self.train_step     = None
         self.global_step    = None
@@ -120,14 +151,16 @@ class DQN_module:
         self.merged_test    = None
 
         self.test_comp_name = None
+
         ## build DQN model ##
-        #self.createNetwork() #CNN network
-        self.CreateMultiRNN(2, 1024) # LSTM network
-        # create saver #
+        self.createNetwork()
+
+        ## create saver ##
         with self.sess.graph.as_default():
             self.saver = tf.train.Saver()
         self.createOP()
-        # init network var #
+        
+        ## init network var ##
         self.sess.run(self.init_op)
 
 
@@ -162,9 +195,6 @@ class DQN_module:
             tf.histogram_summary(name+'w', W)
             tf.histogram_summary(name+'b', b)
 
-        for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=name):
-            tf.add_to_collection("L2_VARIABLES", var)
-
         self.update_list.append(target_W.assign(W))
         self.update_list.append(target_b.assign(b))
         
@@ -192,9 +222,6 @@ class DQN_module:
                 activation = z_out
                 target_activation = target_z_out
 
-        for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=name):
-            tf.add_to_collection("L2_VARIABLES", var)
-
         self.update_list.append(target_W.assign(W))
         self.update_list.append(target_b.assign(b))
         
@@ -203,51 +230,10 @@ class DQN_module:
     def max_pool_2x2(self, x, name):
         return tf.nn.max_pool(x, ksize = [1, 2, 2, 1], strides = [1, 2, 2, 1], padding = "SAME", name=name+'pool')
 
-    def CreateMultiRNN(self, n_layer, n_hidden):
-       
-        with self.sess.graph.as_default():
-            # input
-            with tf.name_scope('input'):
-                self.s = tf.placeholder('float', shape=[None, INPUT_DIM, DAYS_RANGE], name='input_state')
-                input_trans = tf.transpose(self.s, [2, 0, 1]) # [DAYS_RANGE, None, INPUT_DIM]
-                input_reshape = tf.reshape(input_trans, [-1, INPUT_DIM])
-                input_list = tf.split(0, DAYS_RANGE, input_reshape) # split to DAY_RANGE element
-
-            with tf.name_scope('tg_input'):
-                self.target_s = tf.placeholder('float', shape=[None, INPUT_DIM, DAYS_RANGE], name='input_state')
-                tg_input_trans = tf.transpose(self.target_s, [2, 0, 1]) # [DAYS_RANGE, None, INPUT_DIM]
-                tg_input_reshape = tf.reshape(tg_input_trans, [-1, INPUT_DIM])
-                tg_input_list = tf.split(0, DAYS_RANGE, tg_input_reshape) # split to DAY_RANGE element
-
-            # multi LSTM
-            lstm_cell = rnn_cell.BasicLSTMCell(n_hidden, forget_bias=1.0, state_is_tuple=True)
-            lstm_stack = rnn_cell.MultiRNNCell([lstm_cell] * n_layer, state_is_tuple=True)
-
-            tg_lstm_cell = rnn_cell.BasicLSTMCell(n_hidden, forget_bias=1.0, state_is_tuple=True)
-            tg_lstm_stack = rnn_cell.MultiRNNCell([tg_lstm_cell] * n_layer, state_is_tuple=True)
-
-            lstm_output, hidden_states = rnn.rnn(lstm_stack, input_list, dtype='float', scope='LSTMStack') # out: [timestep, batch, hidden], state: [cell, c+h, batch, hidden]
-            tg_lstm_output, tg_hidden_states = rnn.rnn(tg_lstm_stack, tg_input_list, dtype='float', scope='tg_LSTMStack')
-            
-            for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="LSTMStack"):
-                tf.add_to_collection("L2_VARIABLES", var)
-            
-            h_fc1 = self.FC_layer(lstm_output[-1], tg_lstm_output[-1], [n_hidden, 1024], name='h_fc1', activate=True)
-            h_fc2 = self.FC_layer(h_fc1[0], h_fc1[1], [1024, ACTIONS], name='h_fc2', activate=False)
-
-            key = tf.GraphKeys.TRAINABLE_VARIABLES
-            update_pair = zip(tf.get_collection(key, scope="LSTMStack"), tf.get_collection(key, scope="tg_LSTMStack"))
-            for var, tg_var in update_pair:
-                self.update_list.append(tg_var.assign(var))
-
-            # readout layer
-            self.readout = h_fc2[0]
-            self.target_readout = h_fc2[1]
-
     def createNetwork(self):
        
         with self.sess.graph.as_default():
-            # input layer
+            # input layer #
             with tf.name_scope('input'):
                 self.s = tf.placeholder("float", [None, INPUT_DIM, DAYS_RANGE], name='input_state')
                 s_4d = tf.reshape(self.s, [-1, INPUT_DIM, DAYS_RANGE, 1])
@@ -264,7 +250,7 @@ class DQN_module:
             target_h_conv1_dcon = tf.concat(3, [h_conv1_1x[1], h_conv1_2x[1], h_conv1_5x[1]])'''
             
             h_conv2 = self.conv2d_relu(h_conv1_5x[0], h_conv1_5x[1], [INPUT_DIM, 3, 32, 64], 1, name='h_conv2')
-            h_conv3 = self.conv2d_relu(h_conv2[0], h_conv2[1], [INPUT_DIM, 3, 64, 64], 1, name='h_conv3')
+            h_conv3 = self.conv2d_relu(h_conv2[0], h_conv2[1], [INPUT_DIM, 2, 64, 64], 1, name='h_conv3')
             
             conv3_flat = tf.reshape(h_conv3[0], [-1, INPUT_DIM*DAYS_RANGE*64], name='flatten')
             target_conv3_flat = tf.reshape(h_conv3[1], [-1, INPUT_DIM*DAYS_RANGE*64], name='target_flatten')
@@ -272,7 +258,7 @@ class DQN_module:
             h_fc1 = self.FC_layer(conv3_flat, target_conv3_flat, [INPUT_DIM*DAYS_RANGE*64, 1024], name='h_fc1', activate=True)
             h_fc2 = self.FC_layer(h_fc1[0], h_fc1[1], [1024, ACTIONS], name='h_fc2', activate=False)
 
-            # readout layer
+            # readout layer #
             self.readout = h_fc2[0]
             self.target_readout = h_fc2[1]
 
@@ -283,23 +269,24 @@ class DQN_module:
             self.global_step = tf.Variable(0, name="global_step", trainable=False)
             with tf.name_scope('train'):
                 self.in_action = tf.placeholder("float", [None, ACTIONS], 'input_action')
-                self.targetQ = tf.placeholder("float", [None], 'input_Q')
+                self.targetQ   = tf.placeholder("float", [None], 'input_Q')
+                self.sample_IS = tf.placeholder("float", [None], 'IS')
                 
-                l2_loss = tf.add_n([tf.nn.l2_loss(var) for var in tf.get_collection("L2_VARIABLES")]) ## l2 loss
-                print([var.name for var in tf.get_collection("L2_VARIABLES")])
+                l2_loss = tf.add_n([tf.nn.l2_loss(var) for var in tf.trainable_variables()]) ## l2 loss
 
-                readout_actionQ = tf.reduce_sum(tf.mul(self.readout, self.in_action), reduction_indices=1) ## Q value of chosen action ##
-                self.cost = tf.reduce_mean(tf.square(self.targetQ - readout_actionQ)) + 0.0001*l2_loss ## total cost ##
+                readout_actionQ = tf.reduce_sum(tf.mul(self.readout, self.in_action), reduction_indices=1) ## Q value of chosen action
+                self.TDErr = self.targetQ - readout_actionQ
+                self.cost = tf.reduce_mean(tf.mul(tf.square(self.TDErr), self.sample_IS)) + 0.005*l2_loss ## total cost
                 
-                ## training op ##
-                start_l_rate = 0.0005
+                # training op #
+                start_l_rate = 0.00025
                 decay_step = 100000
                 decay_rate = 0.5
                 learning_rate = tf.train.exponential_decay(start_l_rate, self.global_step, decay_step, decay_rate, staircase=False)
-                grad_op = tf.train.AdamOptimizer(learning_rate=learning_rate)
+                grad_op = tf.train.RMSPropOptimizer(learning_rate=learning_rate)
                 self.train_step = tf.contrib.layers.optimize_loss(loss=self.cost, 
                                                              global_step=self.global_step, 
-                                                             learning_rate=0.0005, 
+                                                             learning_rate=0.00025, 
                                                              optimizer=grad_op, 
                                                              clip_gradients=1)
                 tf.scalar_summary('learning_rate', learning_rate)
@@ -338,10 +325,9 @@ class DQN_module:
 
 
     def TestAcc(self, step):
-        
         if step % 10000 == 0 or self.test_Market == None:
             self.test_Market, self.test_comp_name = self.MarketMgr.NextTestMkt()
-        # get the first state by doing nothing and preprocess the image to 80x80x4
+        # get the first DAYS_RANGE state by doing nothing to get the first input stack #
         do_nothing = np.zeros(ACTIONS)
         do_nothing[0] = 1
         date_t, x_t, r_0, terminal_0, rev_0 = self.test_Market.Invest_step(do_nothing)
@@ -382,7 +368,7 @@ class DQN_module:
                 else:
                     RT_low += 1.
             total_days += 1
-            '''if total_days % 10 == 0 or terminal_t:
+            '''if total_days % 50 == 0 or terminal_t:
                 print("TIMESTEP", total_days,
                       "/ Date", date_t1, "/ ACTION", ACTIONS_NAME[action_index], "/ REWARD", r_t,
                       "/ Q_MAX %e" % np.max(readout_t), '/ Revenue %.4f' % rev_t)'''
@@ -402,8 +388,8 @@ class DQN_module:
 
 
     def Inference(self):
-        # loading networks 
-        checkpoint = tf.train.get_checkpoint_state("saved_networks_ver3")
+        ## loading networks ##
+        checkpoint = tf.train.get_checkpoint_state("saved_networks_ver4")
         if checkpoint and checkpoint.model_checkpoint_path:
             self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
             print("Successfully loaded:", checkpoint.model_checkpoint_path)
@@ -414,7 +400,7 @@ class DQN_module:
             sys.exit(0)
 
         self.test_Market, comp_name = self.MarketMgr.NextTestMkt()
-        # get the first state by doing nothing and preprocess the image to 80x80x4
+        # get the first DAYS_RANGE state by doing nothing to get the first input stack #
         do_nothing = np.zeros(ACTIONS)
         do_nothing[0] = 1
         date_t, x_t, r_0, terminal_0, rev_0 = self.test_Market.Invest_step(do_nothing)
@@ -425,6 +411,9 @@ class DQN_module:
             s_t = np.append(s_t, x_t.reshape(INPUT_DIM, 1), axis=1)
         assert s_t.shape[1] == DAYS_RANGE
         
+        plt.ion()
+        color_map = ['g-', 'r-']
+
         ## calc ACC ##
         valid_days = 0.
         RT_high = 0.
@@ -433,6 +422,8 @@ class DQN_module:
         corr_RT_low = 0.
         correct_pred = 0.
         total_days = 0.
+        Close_p = self.test_Market.GetClose()[DAYS_RANGE-1:-1]
+        full_corr_or_not = []
         while True:
             readout_t = self.sess.run(self.readout, feed_dict={self.s : [s_t]})[0]
             a_t = np.zeros([ACTIONS])
@@ -448,6 +439,9 @@ class DQN_module:
                     corr_RT_high += 1.
                 else:
                     corr_RT_low += 1.
+                full_corr_or_not.append(1)
+            else:
+                full_corr_or_not.append(0)
             if not r_t == 0:
                 valid_days += 1
                 if abs(r_t) > HIGH_THRE:
@@ -475,31 +469,37 @@ class DQN_module:
         self.sess_record.close()
         self.sess.close()
 
+        ## draw action-close_price figure ##
+        assert len(full_corr_or_not) == len(Close_p)
+        for i in xrange(len(full_corr_or_not)-1):
+            plt.plot([i, i+1], Close_p[i:i+2], color_map[int(full_corr_or_not[i])])
+        plt.show()
+        raw_input("press to continue...")
+
 
     def trainNetwork(self):
         
-        # create summaries folder
-        if tf.gfile.Exists('./summary_ver3/train'):
-            tf.gfile.DeleteRecursively('./summary_ver3/train')
-        tf.gfile.MakeDirs('./summary/train')
-        train_writer = tf.train.SummaryWriter('./summary_ver3/train', self.sess.graph)
+        ## create summaries folder ##
+        if tf.gfile.Exists('./summary_ver4/train'):
+            tf.gfile.DeleteRecursively('./summary_ver4/train')
+        tf.gfile.MakeDirs('./summary_ver4/train')
+        train_writer = tf.train.SummaryWriter('./summary_ver4/train', self.sess.graph)
 
-        if tf.gfile.Exists('./summary_ver3/record'):
-            tf.gfile.DeleteRecursively('./summary_ver3/record')
-        tf.gfile.MakeDirs('./summary/record')
-        record_writer = tf.train.SummaryWriter('./summary_ver3/record', self.sess_record.graph)
+        if tf.gfile.Exists('./summary_ver4/record'):
+            tf.gfile.DeleteRecursively('./summary_ver4/record')
+        tf.gfile.MakeDirs('./summary_ver4/record')
+        record_writer = tf.train.SummaryWriter('./summary_ver4/record', self.sess_record.graph)
         
         
-        # loading networks 
-        checkpoint = tf.train.get_checkpoint_state("saved_networks_ver3")
+        ## loading networks ##
+        checkpoint = tf.train.get_checkpoint_state("saved_networks_ver4")
         if checkpoint and checkpoint.model_checkpoint_path:
             self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
             print("Successfully loaded:", checkpoint.model_checkpoint_path)
         else:
             print("Could not find old network weights")
 
-        # start training
-        
+        ## start training ##
         epsilon = INITIAL_EPSILON
         t = 0
         state = "observe"
@@ -507,7 +507,7 @@ class DQN_module:
         market_fin = False
         while True:
             self.Market, comp_name = self.MarketMgr.NextTrainMkt()
-            # get the first state by doing nothing and preprocess the image to 80x80x4
+            # get the first state by doing nothing and duplcate DAYS_RANGE time to get the first input stack #
             do_nothing = np.zeros(ACTIONS)
             do_nothing[0] = 1
             date_t, x_t, r_0, terminal_0, revenue_0 = self.Market.Invest_step(do_nothing)
@@ -522,28 +522,25 @@ class DQN_module:
             total_train = 0.
             while "flappy bird" != "angry bird":
                 
-                ## choose an action epsilon greedily ##
+                # choose an action epsilon greedily #
                 readout_t = self.sess.run(self.readout, feed_dict={self.s : [s_t]})[0]
                 
                 a_t = np.zeros([ACTIONS])
                 action_index = 0
-                if t % FRAME_PER_ACTION == 0:
-                    if random.random() <= epsilon:
-                        '''if not state == "observe":
-                            print("----------Random Action----------")'''
-                        action_index = random.randrange(ACTIONS)
-                        a_t[random.randrange(ACTIONS)] = 1
-                    else:
-                        action_index = np.argmax(readout_t)
-                        a_t[action_index] = 1
+                if random.random() <= epsilon:
+                    '''if not state == "observe":
+                        print("----------Random Action----------")'''
+                    action_index = random.randrange(ACTIONS)
+                    a_t[random.randrange(ACTIONS)] = 1
                 else:
-                    a_t[0] = 1 # do nothing
+                    action_index = np.argmax(readout_t)
+                    a_t[action_index] = 1
 
-                # scale down epsilon
+                # scale down epsilon #
                 if epsilon > FINAL_EPSILON and (not state == "observe"):
                     epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORE
 
-                # run the selected action and observe next state and reward
+                # run the selected action and observe next state and reward #
                 date_t1, x_t1, r_t, terminal_t, revenue_t = self.Market.Invest_step(a_t)
                
                 if not state == 'observe' and (t+1) % 50 == 0:
@@ -557,16 +554,15 @@ class DQN_module:
                 if terminal_t == True:
                     market_fin = True
 
-                ## store the transition in memory ##
-                self.D.append((s_t, a_t, r_t, s_t1, terminal_t))
-                if len(self.D) > REPLAY_MEMORY:
-                    self.D.popleft()
+                # store the transition in memory #
+                self.D.append((s_t, a_t, r_t, s_t1, terminal_t), np.inf)
+                '''if len(self.D) > REPLAY_MEMORY:
+                    self.D.popleft()'''
 
-                loss = 0
-                ## only train if done observing ##
+                # only train if done observing #
                 if not state == "observe":
                     # sample a minibatch to train on #
-                    minibatch = random.sample(self.D, BATCH)
+                    minibatch, minibatch_time, minibatch_IS = self.D.GetBatch()
 
                     # get the batch variables
                     s_j_batch = [d[0] for d in minibatch]
@@ -574,7 +570,7 @@ class DQN_module:
                     r_batch = [d[2] for d in minibatch]
                     s_j1_batch = [d[3] for d in minibatch]
 
-                    '''## DQN ##
+                    '''# DQN #
                     y_batch = []
                     readout_j1_batch = self.sess.run(self.target_readout, feed_dict = {self.target_s : s_j1_batch})
                     for i in xrange(0, len(minibatch)):
@@ -585,13 +581,13 @@ class DQN_module:
                         else:
                             y_batch.append(r_batch[i] + GAMMA * np.max(readout_j1_batch[i]))'''
                     
-                    ## DDQN ##
+                    # DDQN #
                     y_batch = []
                     readout_j1_batch = self.sess.run(self.readout, feed_dict = {self.s : s_j1_batch})
                     readout_j1_batch_tg = self.sess.run(self.target_readout, feed_dict = {self.target_s : s_j1_batch})
                     for i in xrange(0, len(minibatch)):
                         terminal = minibatch[i][4]
-                        # if terminal, only equals reward
+                        # if terminal, only equals reward #
                         if terminal:
                             y_batch.append(r_batch[i])
                         else:
@@ -600,16 +596,18 @@ class DQN_module:
 
                     run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
                     run_metadata = tf.RunMetadata()
-                    # perform gradient step
-                    _, summary, loss = self.sess.run([self.train_step, self.merged, self.cost], 
-                                                     feed_dict = {self.targetQ : y_batch, self.in_action : a_batch, self.s : s_j_batch}, 
-                                                     options=run_options, 
-                                                     run_metadata=run_metadata)
+                    # perform gradient step #
+                    feed_dict = {self.targetQ : y_batch, self.in_action : a_batch, self.s : s_j_batch, self.sample_IS : minibatch_IS}
+                    _, summary, td_err, loss = self.sess.run([self.train_step, self.merged, self.TDErr, self.cost], 
+                                                             feed_dict = feed_dict, 
+                                                             options=run_options, 
+                                                             run_metadata=run_metadata)
+                    self.D.UpdateTDErr(minibatch_time, td_err)
                     if (t+1) % 50 == 0:
                         train_writer.add_run_metadata(run_metadata, date_t1+'_'+str(episode))
                         train_writer.add_summary(summary, t+1)
                 
-                ## update the old values ##
+                # update the old values #
                 s_t = s_t1
                 t += 1
                 if not state == "observe":
@@ -629,7 +627,7 @@ class DQN_module:
                     if t % self.update_freq == 0:
                         self.sess.run(self.update_list) # updating target network
 
-                ## report result ##
+                # report result #
                 if t % 10 == 0 or market_fin == True:
                     if not state == "observe":
                         print("STEP", t, "/ ", state,
@@ -646,15 +644,15 @@ class DQN_module:
                                   "/ ", date_t1, "/ ", ACTIONS_NAME[action_index], "/ REWARD", r_t,
                                   "/ Q_MAX %e" % np.max(readout_t), '/ REV %.4f' % revenue_t)
                 
-                ## testing and save networks every 200 steps ##
+                # testing and save networks every 200 steps #
                 if t % 200 == 0 and (not state == "observe"):
                     accuracy, final_rev = self.TestAcc(t)
                     acc_summary = self.sess_record.run(self.merged_test, feed_dict={self.testAcc : accuracy, self.testRev : final_rev})
                     record_writer.add_summary(acc_summary, t)
 
-                    self.saver.save(self.sess, 'saved_networks_ver3/' + "MIXED" + '-dqn', global_step=t)
+                    self.saver.save(self.sess, 'saved_networks_ver4/' + "MIXED" + '-dqn', global_step=t)
                 
-                ## check state ##
+                # check state #
                 if episode < OBSERVE and state == "observe":
                     state = "observe"
                 elif t >= EXPLORE and state == "explore":
@@ -662,9 +660,9 @@ class DQN_module:
                 else:
                     state = state
                 
-                ## check temination ##
+                # check temination #
                 if market_fin == True:
-                    print('EPISODE %d' % (episode+1), 'finished', 'Final Revenue: %.4f' % revenue_t, '\n')
+                    print('EPISODE %d' % (episode+1), 'finished', 'Final Revenue: %.4f' % revenue_t)
                     episode += 1
                     market_fin = False
                     if episode >= OBSERVE and state == "observe":
